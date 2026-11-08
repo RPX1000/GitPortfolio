@@ -1,0 +1,580 @@
+import csv
+import queue
+import re
+import subprocess
+import threading
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, ttk
+
+import customtkinter as ctk
+import yt_dlp
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = Path.home() / "Downloads"
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "conversion_history.csv"
+LOG_FIELDS = ["timestamp", "status", "title", "url", "file_path", "message"]
+
+URL_PATTERN = re.compile(r"(youtube\.com|youtu\.be)", re.IGNORECASE)
+
+LOG_COLORS = {
+    "success": "#4ADE80",
+    "error": "#F87171",
+    "info": "#9CA3AF",
+}
+
+TABLE_BG = "#1E1E1E"
+TABLE_FG = "#E5E7EB"
+TABLE_HEADER_BG = "#2B2B2B"
+TABLE_SELECT_BG = "#3B82F6"
+
+
+class _SilentLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+class YouTubeToMp3App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("YouTube to MP3 Converter")
+        self.geometry("920x740")
+        self.minsize(780, 620)
+
+        self.event_queue = queue.Queue()
+        self.is_running = False
+        self.history_records = []
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        self._build_header()
+        self._build_tabs()
+        self._load_history_from_disk()
+
+        self.after(100, self._poll_queue)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_header(self):
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, padx=24, pady=(24, 8), sticky="ew")
+
+        ctk.CTkLabel(
+            header,
+            text="YouTube to MP3 Converter",
+            font=ctk.CTkFont(size=26, weight="bold"),
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            header,
+            text=f"Paste one or more YouTube links below. Files are saved to {DOWNLOADS_DIR}",
+            font=ctk.CTkFont(size=13),
+            text_color="#9CA3AF",
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _build_tabs(self):
+        self.tabview = ctk.CTkTabview(self, corner_radius=12)
+        self.tabview.grid(row=1, column=0, padx=24, pady=(0, 24), sticky="nsew")
+        self.tabview.add("Convert")
+        self.tabview.add("History")
+
+        convert_tab = self.tabview.tab("Convert")
+        convert_tab.grid_columnconfigure(0, weight=1)
+        convert_tab.grid_rowconfigure(3, weight=1)
+
+        history_tab = self.tabview.tab("History")
+        history_tab.grid_columnconfigure(0, weight=1)
+        history_tab.grid_rowconfigure(1, weight=1)
+
+        self._build_input_section(convert_tab)
+        self._build_action_bar(convert_tab)
+        self._build_progress_section(convert_tab)
+        self._build_log_section(convert_tab)
+
+        self._build_history_section(history_tab)
+
+    def _build_input_section(self, parent):
+        frame = ctk.CTkFrame(parent, corner_radius=12)
+        frame.grid(row=0, column=0, padx=8, pady=(12, 8), sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+
+        top_row = ctk.CTkFrame(frame, fg_color="transparent")
+        top_row.grid(row=0, column=0, padx=16, pady=(14, 0), sticky="ew")
+        top_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            top_row, text="YouTube Links", font=ctk.CTkFont(size=15, weight="bold")
+        ).grid(row=0, column=0, sticky="w")
+
+        self.link_count_label = ctk.CTkLabel(
+            top_row, text="0 links detected", font=ctk.CTkFont(size=12), text_color="#9CA3AF"
+        )
+        self.link_count_label.grid(row=0, column=1, sticky="e")
+
+        self.url_textbox = ctk.CTkTextbox(frame, height=140, corner_radius=8)
+        self.url_textbox.grid(row=1, column=0, padx=16, pady=(8, 6), sticky="ew")
+        self.url_textbox.insert(
+            "0.0",
+            "Paste YouTube links here, one per line\ne.g. https://www.youtube.com/watch?v=...",
+        )
+        self.url_textbox.bind("<FocusIn>", self._clear_placeholder)
+        self.url_textbox.bind("<KeyRelease>", self._update_link_count)
+        self._placeholder_active = True
+
+        ctk.CTkLabel(
+            frame,
+            text="One link per line. Duplicate links are only converted once.",
+            font=ctk.CTkFont(size=11),
+            text_color="#6B7280",
+        ).grid(row=2, column=0, padx=16, pady=(0, 12), sticky="w")
+
+    def _build_action_bar(self, parent):
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.grid(row=1, column=0, padx=8, pady=4, sticky="ew")
+
+        self.convert_button = ctk.CTkButton(
+            bar,
+            text="Convert to MP3",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=38,
+            command=self._on_convert_clicked,
+        )
+        self.convert_button.pack(side="left")
+
+        ctk.CTkButton(
+            bar,
+            text="Clear",
+            width=80,
+            height=38,
+            fg_color="transparent",
+            border_width=1,
+            command=self._on_clear_clicked,
+        ).pack(side="left", padx=(10, 0))
+
+        ctk.CTkButton(
+            bar,
+            text="Open Downloads Folder",
+            width=170,
+            height=38,
+            fg_color="transparent",
+            border_width=1,
+            command=self._open_downloads_folder,
+        ).pack(side="left", padx=(10, 0))
+
+    def _build_progress_section(self, parent):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(row=2, column=0, padx=8, pady=(8, 4), sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+
+        self.progress_bar = ctk.CTkProgressBar(frame)
+        self.progress_bar.grid(row=0, column=0, sticky="ew")
+        self.progress_bar.set(0)
+
+        self.status_label = ctk.CTkLabel(
+            frame, text="Idle", font=ctk.CTkFont(size=12), text_color="#9CA3AF", anchor="w"
+        )
+        self.status_label.grid(row=1, column=0, pady=(6, 0), sticky="ew")
+
+    def _build_log_section(self, parent):
+        frame = ctk.CTkFrame(parent, corner_radius=12)
+        frame.grid(row=3, column=0, padx=8, pady=(8, 12), sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+
+        header_row = ctk.CTkFrame(frame, fg_color="transparent")
+        header_row.grid(row=0, column=0, padx=16, pady=(14, 0), sticky="ew")
+        header_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header_row, text="Conversion Log", font=ctk.CTkFont(size=15, weight="bold")
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkButton(
+            header_row,
+            text="Clear Log",
+            width=90,
+            height=26,
+            fg_color="transparent",
+            border_width=1,
+            command=self._clear_log,
+        ).grid(row=0, column=1, sticky="e")
+
+        self.log_textbox = ctk.CTkTextbox(frame, corner_radius=8, state="disabled")
+        self.log_textbox.grid(row=1, column=0, padx=16, pady=(8, 4), sticky="nsew")
+
+        for tag, color in LOG_COLORS.items():
+            self.log_textbox._textbox.tag_config(tag, foreground=color)
+
+        ctk.CTkLabel(
+            frame,
+            text="This is a live, clearable feed. The permanent, exportable record is kept in the History tab.",
+            font=ctk.CTkFont(size=11),
+            text_color="#6B7280",
+        ).grid(row=2, column=0, padx=16, pady=(0, 12), sticky="w")
+
+    def _build_history_section(self, parent):
+        header_row = ctk.CTkFrame(parent, fg_color="transparent")
+        header_row.grid(row=0, column=0, padx=8, pady=(12, 8), sticky="ew")
+        header_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header_row, text="Conversion History", font=ctk.CTkFont(size=15, weight="bold")
+        ).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(
+            header_row,
+            text="Permanent record of every conversion. Cannot be edited or cleared from the app.",
+            font=ctk.CTkFont(size=11),
+            text_color="#6B7280",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        button_row = ctk.CTkFrame(header_row, fg_color="transparent")
+        button_row.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        ctk.CTkButton(
+            button_row, text="Export CSV", width=110, height=30, command=self._export_csv
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            button_row,
+            text="Reveal Log File",
+            width=120,
+            height=30,
+            fg_color="transparent",
+            border_width=1,
+            command=self._reveal_log_file,
+        ).pack(side="left", padx=(8, 0))
+
+        table_frame = ctk.CTkFrame(parent, corner_radius=12)
+        table_frame.grid(row=1, column=0, padx=8, pady=(0, 4), sticky="nsew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "History.Treeview",
+            background=TABLE_BG,
+            fieldbackground=TABLE_BG,
+            foreground=TABLE_FG,
+            rowheight=26,
+            borderwidth=0,
+            font=("TkDefaultFont", 12),
+        )
+        style.configure(
+            "History.Treeview.Heading",
+            background=TABLE_HEADER_BG,
+            foreground=TABLE_FG,
+            borderwidth=0,
+            relief="flat",
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        style.map(
+            "History.Treeview",
+            background=[("selected", TABLE_SELECT_BG)],
+            foreground=[("selected", "#FFFFFF")],
+        )
+        style.map("History.Treeview.Heading", background=[("active", TABLE_HEADER_BG)])
+
+        columns = ("time", "status", "title", "url", "file")
+        self.history_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            style="History.Treeview",
+        )
+        self.history_tree.heading("time", text="Time")
+        self.history_tree.heading("status", text="Status")
+        self.history_tree.heading("title", text="Title")
+        self.history_tree.heading("url", text="Source URL")
+        self.history_tree.heading("file", text="Saved File")
+
+        self.history_tree.column("time", width=140, anchor="w", stretch=False)
+        self.history_tree.column("status", width=80, anchor="center", stretch=False)
+        self.history_tree.column("title", width=240, anchor="w")
+        self.history_tree.column("url", width=220, anchor="w")
+        self.history_tree.column("file", width=260, anchor="w")
+
+        self.history_tree.tag_configure("success", foreground=LOG_COLORS["success"])
+        self.history_tree.tag_configure("error", foreground=LOG_COLORS["error"])
+
+        self.history_tree.grid(row=0, column=0, padx=(12, 0), pady=12, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.history_tree.yview)
+        scrollbar.grid(row=0, column=1, pady=12, sticky="ns")
+        self.history_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.history_count_label = ctk.CTkLabel(
+            parent, text="0 records", font=ctk.CTkFont(size=11), text_color="#6B7280"
+        )
+        self.history_count_label.grid(row=2, column=0, padx=8, pady=(0, 8), sticky="w")
+
+    # ------------------------------------------------------------------
+    # Input handling
+    # ------------------------------------------------------------------
+    def _clear_placeholder(self, _event=None):
+        if self._placeholder_active:
+            self.url_textbox.delete("0.0", "end")
+            self._placeholder_active = False
+
+    def _update_link_count(self, _event=None):
+        links = self._parse_links()
+        label = "1 link detected" if len(links) == 1 else f"{len(links)} links detected"
+        self.link_count_label.configure(text=label)
+
+    def _parse_links(self):
+        text = self.url_textbox.get("0.0", "end")
+        lines = [line.strip() for line in text.splitlines()]
+        candidates = [line for line in lines if line and URL_PATTERN.search(line)]
+        return list(dict.fromkeys(candidates))
+
+    def _on_clear_clicked(self):
+        self.url_textbox.delete("0.0", "end")
+        self._placeholder_active = False
+        self._update_link_count()
+
+    def _clear_log(self):
+        self.log_textbox.configure(state="normal")
+        self.log_textbox.delete("0.0", "end")
+        self.log_textbox.configure(state="disabled")
+
+    def _open_downloads_folder(self):
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(DOWNLOADS_DIR)], check=False)
+
+    # ------------------------------------------------------------------
+    # Conversion workflow
+    # ------------------------------------------------------------------
+    def _on_convert_clicked(self):
+        if self.is_running:
+            return
+
+        links = self._parse_links()
+        if not links:
+            self._append_log("info", "No valid YouTube links found. Paste one or more links, one per line.")
+            return
+
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.is_running = True
+        self.convert_button.configure(state="disabled", text="Converting...")
+        self.progress_bar.set(0)
+        self._append_log("info", f"Starting batch of {len(links)} link(s)")
+
+        thread = threading.Thread(target=self._run_batch, args=(links,), daemon=True)
+        thread.start()
+
+    def _run_batch(self, links):
+        total = len(links)
+        for index, link in enumerate(links):
+            self.event_queue.put(("status", f"Processing link {index + 1} of {total}..."))
+            self._download_one(link)
+            self.event_queue.put(("progress", (index + 1) / total))
+
+        self.event_queue.put(("status", f"Done — {total} of {total} link(s) processed"))
+        self.event_queue.put(("batch_done", None))
+
+    def _download_one(self, link):
+        last_percent = {"value": None}
+
+        def progress_hook(d):
+            if d.get("status") == "downloading":
+                downloaded = d.get("downloaded_bytes") or 0
+                total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if total_bytes:
+                    percent = int(downloaded / total_bytes * 100)
+                    if percent != last_percent["value"]:
+                        last_percent["value"] = percent
+                        name = Path(d.get("filename", link)).stem
+                        self.event_queue.put(("status", f"Downloading: {name} ({percent}%)"))
+            elif d.get("status") == "finished":
+                self.event_queue.put(("status", "Converting to MP3..."))
+
+        ydl_opts = {
+    "ffmpeg_location": "/opt/homebrew/bin/ffmpeg",
+        "js_runtimes": {"deno": {"path": "/opt/homebrew/bin/deno"}},
+            "format": "bestaudio/best",
+            "outtmpl": str(DOWNLOADS_DIR / "%(title)s.%(ext)s"),
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+            "noplaylist": True,
+            "progress_hooks": [progress_hook],
+            "quiet": True,
+            "no_warnings": True,
+            "logger": _SilentLogger(),
+        }
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(link, download=True)
+                title = info.get("title", link)
+                file_path = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
+                self.event_queue.put(("log", ("success", f"Converted: {title}")))
+                self.event_queue.put(
+                    (
+                        "history",
+                        {
+                            "timestamp": timestamp,
+                            "status": "success",
+                            "title": title,
+                            "url": link,
+                            "file_path": str(file_path),
+                            "message": "",
+                        },
+                    )
+                )
+        except Exception as exc:
+            self.event_queue.put(("log", ("error", f"Failed: {link} — {exc}")))
+            self.event_queue.put(
+                (
+                    "history",
+                    {
+                        "timestamp": timestamp,
+                        "status": "error",
+                        "title": "",
+                        "url": link,
+                        "file_path": "",
+                        "message": str(exc),
+                    },
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # History / persistent log
+    # ------------------------------------------------------------------
+    def _load_history_from_disk(self):
+        if not LOG_FILE.exists():
+            return
+        try:
+            with LOG_FILE.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self._insert_history_row(row, persist=False)
+        except Exception as exc:
+            self._append_log("error", f"Could not load saved history: {exc}")
+
+    def _insert_history_row(self, record, persist=True):
+        self.history_records.append(record)
+
+        status = (record.get("status") or "").lower()
+        tag = status if status in ("success", "error") else ""
+
+        self.history_tree.insert(
+            "",
+            "end",
+            values=(
+                record.get("timestamp", ""),
+                status.upper(),
+                record.get("title", ""),
+                record.get("url", ""),
+                record.get("file_path", ""),
+            ),
+            tags=(tag,) if tag else (),
+        )
+
+        count = len(self.history_records)
+        self.history_count_label.configure(text=f"{count} record{'s' if count != 1 else ''}")
+
+        if persist:
+            self._write_record_to_disk(record)
+
+    def _write_record_to_disk(self, record):
+        file_exists = LOG_FILE.exists()
+        with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({field: record.get(field, "") for field in LOG_FIELDS})
+
+    def _export_csv(self):
+        if not self.history_records:
+            self._append_log("info", "No history to export yet.")
+            return
+
+        default_name = f"conversion_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            title="Export Conversion Log",
+            defaultextension=".csv",
+            initialdir=str(DOWNLOADS_DIR),
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv")],
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+                writer.writeheader()
+                for record in self.history_records:
+                    writer.writerow({field: record.get(field, "") for field in LOG_FIELDS})
+            self._append_log("info", f"Exported {len(self.history_records)} record(s) to {path}")
+        except Exception as exc:
+            self._append_log("error", f"Export failed: {exc}")
+
+    def _reveal_log_file(self):
+        if LOG_FILE.exists():
+            subprocess.run(["open", "-R", str(LOG_FILE)], check=False)
+        else:
+            self._append_log("info", "No log file has been created yet.")
+
+    # ------------------------------------------------------------------
+    # Queue polling (runs on the main thread)
+    # ------------------------------------------------------------------
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.event_queue.get_nowait()
+                self._handle_event(kind, payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _handle_event(self, kind, payload):
+        if kind == "status":
+            self.status_label.configure(text=payload)
+        elif kind == "progress":
+            self.progress_bar.set(payload)
+        elif kind == "log":
+            tag, message = payload
+            self._append_log(tag, message)
+        elif kind == "history":
+            self._insert_history_row(payload, persist=True)
+        elif kind == "batch_done":
+            self.is_running = False
+            self.convert_button.configure(state="normal", text="Convert to MP3")
+
+    def _append_log(self, tag, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_textbox.configure(state="normal")
+        self.log_textbox.insert("end", f"[{timestamp}] {message}\n", tag)
+        self.log_textbox.see("end")
+        self.log_textbox.configure(state="disabled")
+
+
+if __name__ == "__main__":
+    app = YouTubeToMp3App()
+    app.mainloop()

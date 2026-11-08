@@ -1,0 +1,24 @@
+# Making a random generating guessing game
+
+import random
+
+x = random.randint(1,100)
+
+y = int(input("Please enter a number to guess: "))
+
+counter = 0
+
+while x != y:
+    if y > x:
+        print("Too high, guess lower.")
+        y = int(input("Please enter a number to guess: "))
+        counter += 1
+    else:
+        print("Too low, guess higher.")
+        y = int(input("Please enter a number to guess: "))
+        counter += 1
+
+print(f"Congrats! You guessed it {x} is the right number!")
+print(f"You guessed the number in {counter} attempts.")
+
+
